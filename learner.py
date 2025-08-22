@@ -12,7 +12,7 @@ from datetime import datetime
 CONNECTOR_URL = os.getenv("CONNECTOR_URL", "https://hubspot-connector.onrender.com")
 BRIDGE_SECRET = os.getenv("BRIDGE_SECRET", "")
 DB_PATH = os.getenv("DB_PATH", "learner.db")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # every 10 minutes
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # every 10 min
 
 # ========================================
 # DB Setup
@@ -20,55 +20,61 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # every 10 minutes
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id TEXT PRIMARY KEY,
-            subject TEXT,
-            content TEXT,
-            created_at TEXT,
-            last_seen TEXT
-        )
-    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS tickets (
+        ticket_id TEXT PRIMARY KEY,
+        subject TEXT,
+        content TEXT,
+        created_at TEXT,
+        last_seen TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS companies (
+        company_id TEXT PRIMARY KEY,
+        name TEXT,
+        domain TEXT,
+        last_seen TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS contacts (
+        contact_id TEXT PRIMARY KEY,
+        email TEXT,
+        firstname TEXT,
+        lastname TEXT,
+        company_id TEXT,
+        last_seen TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS deals (
+        deal_id TEXT PRIMARY KEY,
+        dealname TEXT,
+        amount REAL,
+        stage TEXT,
+        company_id TEXT,
+        last_seen TEXT
+    )""")
     conn.commit()
     conn.close()
 
-def save_ticket(ticket_id, subject, content):
+def upsert(table, data: dict, pk: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""
-        INSERT OR REPLACE INTO tickets (ticket_id, subject, content, created_at, last_seen)
-        VALUES (?, ?, ?, COALESCE((SELECT created_at FROM tickets WHERE ticket_id = ?), ?), ?)
-    """, (ticket_id, subject, content, ticket_id, datetime.utcnow().isoformat(), datetime.utcnow().isoformat()))
+    cols = ", ".join(data.keys())
+    placeholders = ", ".join("?" * len(data))
+    update = ", ".join([f"{k}=excluded.{k}" for k in data.keys()])
+    query = f"INSERT INTO {table} ({cols}) VALUES ({placeholders}) ON CONFLICT({pk}) DO UPDATE SET {update}"
+    c.execute(query, list(data.values()))
     conn.commit()
     conn.close()
 
-def get_ticket_count():
+def count(table):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM tickets")
-    count = c.fetchone()[0]
+    c.execute(f"SELECT COUNT(*) FROM {table}")
+    result = c.fetchone()[0]
     conn.close()
-    return count
-
-def get_common_subjects(limit=5):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT subject, COUNT(*) as freq
-        FROM tickets
-        WHERE subject IS NOT NULL
-        GROUP BY subject
-        ORDER BY freq DESC
-        LIMIT ?
-    """, (limit,))
-    rows = c.fetchall()
-    conn.close()
-    return [{"subject": r[0], "count": r[1]} for r in rows]
+    return result
 
 # ========================================
 # FastAPI
 # ========================================
-app = FastAPI(title="HubSpot Learner Service")
+app = FastAPI(title="HubSpot Learner v2")
 
 @app.on_event("startup")
 async def startup_event():
@@ -81,14 +87,48 @@ def health():
 
 @app.get("/learning/status")
 def learning_status():
-    return {"tickets_indexed": get_ticket_count()}
+    return {
+        "tickets_indexed": count("tickets"),
+        "companies_indexed": count("companies"),
+        "contacts_indexed": count("contacts"),
+        "deals_indexed": count("deals")
+    }
 
 @app.get("/learning/suggestions")
 def learning_suggestions():
-    subjects = get_common_subjects()
+    suggestions = []
+
+    # Data cleanup: missing company domains
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM companies WHERE domain IS NULL OR domain=''")
+    missing_domains = c.fetchone()[0]
+    if missing_domains > 0:
+        suggestions.append(f"{missing_domains} companies are missing domain information.")
+
+    # Data cleanup: contacts without email
+    c.execute("SELECT COUNT(*) FROM contacts WHERE email IS NULL OR email=''")
+    missing_emails = c.fetchone()[0]
+    if missing_emails > 0:
+        suggestions.append(f"{missing_emails} contacts are missing email addresses.")
+
+    conn.close()
+
+    # KB article ideas (most common ticket subjects)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT subject, COUNT(*) as freq 
+                 FROM tickets 
+                 WHERE subject IS NOT NULL 
+                 GROUP BY subject 
+                 ORDER BY freq DESC 
+                 LIMIT 5""")
+    kb_candidates = [{"subject": r[0], "count": r[1]} for r in c.fetchall()]
+    conn.close()
+
     return {
-        "message": "Most common ticket subjects (good candidates for KB articles)",
-        "subjects": subjects
+        "suggestions": suggestions,
+        "kb_candidates": kb_candidates
     }
 
 # ========================================
@@ -97,27 +137,34 @@ def learning_suggestions():
 async def learning_loop():
     while True:
         try:
-            print("[Learner] Polling for tickets...")
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    f"{CONNECTOR_URL}/tickets/search",
-                    params={"limit": 20, "properties": ["subject", "content"]},
-                    headers={"Authorization": BRIDGE_SECRET},
-                    timeout=60
-                )
+            print("[Learner] Polling HubSpot data...")
+
+            async with httpx.AsyncClient(headers={"Authorization": BRIDGE_SECRET}) as client:
+
+                # Tickets
+                r = await client.post(f"{CONNECTOR_URL}/tickets/search",
+                                      json={"limit": 20, "properties": ["subject", "content"]},
+                                      timeout=60)
                 if r.status_code == 200:
-                    data = r.json()
-                    results = data.get("results", [])
-                    for t in results:
-                        ticket_id = t.get("id")
+                    for t in r.json().get("results", []):
                         props = t.get("properties", {})
-                        subject = props.get("subject")
-                        content = props.get("content")
-                        if ticket_id:
-                            save_ticket(ticket_id, subject, content)
-                            print(f"[Learner] Saved ticket {ticket_id}")
-                else:
-                    print(f"[Learner] Error fetching tickets: {r.status_code} {r.text}")
+                        upsert("tickets", {
+                            "ticket_id": t.get("id"),
+                            "subject": props.get("subject"),
+                            "content": props.get("content"),
+                            "created_at": props.get("createdate"),
+                            "last_seen": datetime.utcnow().isoformat()
+                        }, "ticket_id")
+
+                # Companies
+                r = await client.get(f"{CONNECTOR_URL}/companies/get/1")  # Example test
+                # TODO: add proper fetch-all logic via connector (batch support)
+                # For now, learner v2 focuses on tickets but schema is ready.
+
+                # TODO: Same approach for contacts & deals once connector exposes batch endpoints.
+
+            print("[Learner] Polling complete.")
+
         except Exception as e:
             print(f"[Learner] Exception: {e}")
 
