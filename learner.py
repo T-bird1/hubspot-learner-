@@ -12,7 +12,7 @@ from datetime import datetime
 CONNECTOR_URL = os.getenv("CONNECTOR_URL", "https://hubspot-connector.onrender.com")
 BRIDGE_SECRET = os.getenv("BRIDGE_SECRET", "")
 DB_PATH = os.getenv("DB_PATH", "learner.db")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # every 10 min
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "900"))  # every 15 minutes
 
 # ========================================
 # DB Setup
@@ -20,6 +20,7 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # every 10 min
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Tickets
     c.execute("""CREATE TABLE IF NOT EXISTS tickets (
         ticket_id TEXT PRIMARY KEY,
         subject TEXT,
@@ -27,12 +28,14 @@ def init_db():
         created_at TEXT,
         last_seen TEXT
     )""")
+    # Companies
     c.execute("""CREATE TABLE IF NOT EXISTS companies (
         company_id TEXT PRIMARY KEY,
         name TEXT,
         domain TEXT,
         last_seen TEXT
     )""")
+    # Contacts
     c.execute("""CREATE TABLE IF NOT EXISTS contacts (
         contact_id TEXT PRIMARY KEY,
         email TEXT,
@@ -41,6 +44,7 @@ def init_db():
         company_id TEXT,
         last_seen TEXT
     )""")
+    # Deals
     c.execute("""CREATE TABLE IF NOT EXISTS deals (
         deal_id TEXT PRIMARY KEY,
         dealname TEXT,
@@ -74,7 +78,7 @@ def count(table):
 # ========================================
 # FastAPI
 # ========================================
-app = FastAPI(title="HubSpot Learner v2")
+app = FastAPI(title="HubSpot Learner (Final)")
 
 @app.on_event("startup")
 async def startup_event():
@@ -98,25 +102,28 @@ def learning_status():
 def learning_suggestions():
     suggestions = []
 
-    # Data cleanup: missing company domains
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Companies missing domain
     c.execute("SELECT COUNT(*) FROM companies WHERE domain IS NULL OR domain=''")
     missing_domains = c.fetchone()[0]
     if missing_domains > 0:
         suggestions.append(f"{missing_domains} companies are missing domain information.")
 
-    # Data cleanup: contacts without email
+    # Contacts missing email
     c.execute("SELECT COUNT(*) FROM contacts WHERE email IS NULL OR email=''")
     missing_emails = c.fetchone()[0]
     if missing_emails > 0:
         suggestions.append(f"{missing_emails} contacts are missing email addresses.")
 
-    conn.close()
+    # Deals with missing stage
+    c.execute("SELECT COUNT(*) FROM deals WHERE stage IS NULL OR stage=''")
+    missing_stages = c.fetchone()[0]
+    if missing_stages > 0:
+        suggestions.append(f"{missing_stages} deals are missing pipeline stage.")
 
-    # KB article ideas (most common ticket subjects)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    # Common tickets (KB candidates)
     c.execute("""SELECT subject, COUNT(*) as freq 
                  FROM tickets 
                  WHERE subject IS NOT NULL 
@@ -124,6 +131,7 @@ def learning_suggestions():
                  ORDER BY freq DESC 
                  LIMIT 5""")
     kb_candidates = [{"subject": r[0], "count": r[1]} for r in c.fetchall()]
+
     conn.close()
 
     return {
@@ -141,9 +149,9 @@ async def learning_loop():
 
             async with httpx.AsyncClient(headers={"Authorization": BRIDGE_SECRET}) as client:
 
-                # Tickets
+                # -------- Tickets --------
                 r = await client.post(f"{CONNECTOR_URL}/tickets/search",
-                                      json={"limit": 20, "properties": ["subject", "content"]},
+                                      json={"limit": 100, "properties": ["subject", "content", "createdate"]},
                                       timeout=60)
                 if r.status_code == 200:
                     for t in r.json().get("results", []):
@@ -156,12 +164,51 @@ async def learning_loop():
                             "last_seen": datetime.utcnow().isoformat()
                         }, "ticket_id")
 
-                # Companies
-                r = await client.get(f"{CONNECTOR_URL}/companies/get/1")  # Example test
-                # TODO: add proper fetch-all logic via connector (batch support)
-                # For now, learner v2 focuses on tickets but schema is ready.
+                # -------- Companies --------
+                r = await client.post(f"{CONNECTOR_URL}/companies/search",
+                                      json={"limit": 100, "properties": ["name", "domain"]},
+                                      timeout=60)
+                if r.status_code == 200:
+                    for cdata in r.json().get("results", []):
+                        props = cdata.get("properties", {})
+                        upsert("companies", {
+                            "company_id": cdata.get("id"),
+                            "name": props.get("name"),
+                            "domain": props.get("domain"),
+                            "last_seen": datetime.utcnow().isoformat()
+                        }, "company_id")
 
-                # TODO: Same approach for contacts & deals once connector exposes batch endpoints.
+                # -------- Contacts --------
+                r = await client.post(f"{CONNECTOR_URL}/contacts/search",
+                                      json={"limit": 100, "properties": ["email", "firstname", "lastname", "company"]},
+                                      timeout=60)
+                if r.status_code == 200:
+                    for cdata in r.json().get("results", []):
+                        props = cdata.get("properties", {})
+                        upsert("contacts", {
+                            "contact_id": cdata.get("id"),
+                            "email": props.get("email"),
+                            "firstname": props.get("firstname"),
+                            "lastname": props.get("lastname"),
+                            "company_id": props.get("company"),
+                            "last_seen": datetime.utcnow().isoformat()
+                        }, "contact_id")
+
+                # -------- Deals --------
+                r = await client.post(f"{CONNECTOR_URL}/deals/search",
+                                      json={"limit": 100, "properties": ["dealname", "amount", "dealstage", "associatedcompanyid"]},
+                                      timeout=60)
+                if r.status_code == 200:
+                    for d in r.json().get("results", []):
+                        props = d.get("properties", {})
+                        upsert("deals", {
+                            "deal_id": d.get("id"),
+                            "dealname": props.get("dealname"),
+                            "amount": props.get("amount"),
+                            "stage": props.get("dealstage"),
+                            "company_id": props.get("associatedcompanyid"),
+                            "last_seen": datetime.utcnow().isoformat()
+                        }, "deal_id")
 
             print("[Learner] Polling complete.")
 
