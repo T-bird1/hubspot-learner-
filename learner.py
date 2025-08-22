@@ -78,7 +78,7 @@ def count(table):
 # ========================================
 # FastAPI
 # ========================================
-app = FastAPI(title="HubSpot Learner (Final)")
+app = FastAPI(title="HubSpot Learner (Extended)")
 
 @app.on_event("startup")
 async def startup_event():
@@ -100,43 +100,77 @@ def learning_status():
 
 @app.get("/learning/suggestions")
 def learning_suggestions():
-    suggestions = []
+    cleanup = []
+    kb_candidates = []
+    workflow_candidates = []
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Companies missing domain
+    # -------------------------
+    # Data Cleanup
+    # -------------------------
     c.execute("SELECT COUNT(*) FROM companies WHERE domain IS NULL OR domain=''")
-    missing_domains = c.fetchone()[0]
-    if missing_domains > 0:
-        suggestions.append(f"{missing_domains} companies are missing domain information.")
+    if (missing := c.fetchone()[0]) > 0:
+        cleanup.append(f"{missing} companies are missing domain information.")
 
-    # Contacts missing email
     c.execute("SELECT COUNT(*) FROM contacts WHERE email IS NULL OR email=''")
-    missing_emails = c.fetchone()[0]
-    if missing_emails > 0:
-        suggestions.append(f"{missing_emails} contacts are missing email addresses.")
+    if (missing := c.fetchone()[0]) > 0:
+        cleanup.append(f"{missing} contacts are missing email addresses.")
 
-    # Deals with missing stage
     c.execute("SELECT COUNT(*) FROM deals WHERE stage IS NULL OR stage=''")
-    missing_stages = c.fetchone()[0]
-    if missing_stages > 0:
-        suggestions.append(f"{missing_stages} deals are missing pipeline stage.")
+    if (missing := c.fetchone()[0]) > 0:
+        cleanup.append(f"{missing} deals are missing pipeline stage.")
 
-    # Common tickets (KB candidates)
+    # -------------------------
+    # Knowledge Base Candidates
+    # -------------------------
     c.execute("""SELECT subject, COUNT(*) as freq 
                  FROM tickets 
-                 WHERE subject IS NOT NULL 
+                 WHERE subject IS NOT NULL AND subject != '' 
                  GROUP BY subject 
                  ORDER BY freq DESC 
                  LIMIT 5""")
     kb_candidates = [{"subject": r[0], "count": r[1]} for r in c.fetchall()]
 
+    # -------------------------
+    # Workflow Candidates
+    # -------------------------
+
+    # Candidate 1: Alert if company has >5 open tickets
+    c.execute("""SELECT company_id, COUNT(*) 
+                 FROM deals 
+                 WHERE company_id IS NOT NULL 
+                 GROUP BY company_id 
+                 HAVING COUNT(*) > 5""")
+    heavy_companies = [row[0] for row in c.fetchall()]
+    if heavy_companies:
+        workflow_candidates.append(
+            f"Create an alert workflow for CSMs when a company exceeds 5 active deals. {len(heavy_companies)} companies qualify."
+        )
+
+    # Candidate 2: Escalation for old tickets
+    c.execute("""SELECT COUNT(*) 
+                 FROM tickets 
+                 WHERE created_at < date('now','-30 days')""")
+    old_tickets = c.fetchone()[0]
+    if old_tickets > 0:
+        workflow_candidates.append(f"Escalation workflow: {old_tickets} tickets have been open for >30 days.")
+
+    # Candidate 3: Notify when deal lacks associated company
+    c.execute("""SELECT COUNT(*) 
+                 FROM deals 
+                 WHERE company_id IS NULL OR company_id=''""")
+    orphan_deals = c.fetchone()[0]
+    if orphan_deals > 0:
+        workflow_candidates.append(f"Notification workflow: {orphan_deals} deals have no associated company.")
+
     conn.close()
 
     return {
-        "suggestions": suggestions,
-        "kb_candidates": kb_candidates
+        "data_cleanup": cleanup,
+        "kb_candidates": kb_candidates,
+        "workflow_candidates": workflow_candidates
     }
 
 # ========================================
@@ -150,7 +184,7 @@ async def learning_loop():
             async with httpx.AsyncClient(headers={"Authorization": BRIDGE_SECRET}) as client:
 
                 # -------- Tickets --------
-                r = await client.post(f"{CONNECTOR_URL}/tickets/search",
+                r = await client.post(f"{CONNECTOR_URL}/ticketsSearch",
                                       json={"limit": 100, "properties": ["subject", "content", "createdate"]},
                                       timeout=60)
                 if r.status_code == 200:
@@ -165,7 +199,7 @@ async def learning_loop():
                         }, "ticket_id")
 
                 # -------- Companies --------
-                r = await client.post(f"{CONNECTOR_URL}/companies/search",
+                r = await client.post(f"{CONNECTOR_URL}/companiesSearch",
                                       json={"limit": 100, "properties": ["name", "domain"]},
                                       timeout=60)
                 if r.status_code == 200:
@@ -179,7 +213,7 @@ async def learning_loop():
                         }, "company_id")
 
                 # -------- Contacts --------
-                r = await client.post(f"{CONNECTOR_URL}/contacts/search",
+                r = await client.post(f"{CONNECTOR_URL}/contactsSearch",
                                       json={"limit": 100, "properties": ["email", "firstname", "lastname", "company"]},
                                       timeout=60)
                 if r.status_code == 200:
@@ -195,7 +229,7 @@ async def learning_loop():
                         }, "contact_id")
 
                 # -------- Deals --------
-                r = await client.post(f"{CONNECTOR_URL}/deals/search",
+                r = await client.post(f"{CONNECTOR_URL}/dealsSearch",
                                       json={"limit": 100, "properties": ["dealname", "amount", "dealstage", "associatedcompanyid"]},
                                       timeout=60)
                 if r.status_code == 200:
