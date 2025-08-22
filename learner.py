@@ -2,7 +2,7 @@ import asyncio
 import httpx
 import os
 import sqlite3
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from datetime import datetime
 
@@ -78,7 +78,7 @@ def count(table):
 # ========================================
 # FastAPI
 # ========================================
-app = FastAPI(title="HubSpot Learner (Extended)")
+app = FastAPI(title="HubSpot Learner (Full)")
 
 @app.on_event("startup")
 async def startup_event():
@@ -136,8 +136,6 @@ def learning_suggestions():
     # -------------------------
     # Workflow Candidates
     # -------------------------
-
-    # Candidate 1: Alert if company has >5 open tickets
     c.execute("""SELECT company_id, COUNT(*) 
                  FROM deals 
                  WHERE company_id IS NOT NULL 
@@ -146,24 +144,22 @@ def learning_suggestions():
     heavy_companies = [row[0] for row in c.fetchall()]
     if heavy_companies:
         workflow_candidates.append(
-            f"Create an alert workflow for CSMs when a company exceeds 5 active deals. {len(heavy_companies)} companies qualify."
+            f"Alert CSMs when a company exceeds 5 active deals. {len(heavy_companies)} companies qualify."
         )
 
-    # Candidate 2: Escalation for old tickets
     c.execute("""SELECT COUNT(*) 
                  FROM tickets 
                  WHERE created_at < date('now','-30 days')""")
     old_tickets = c.fetchone()[0]
     if old_tickets > 0:
-        workflow_candidates.append(f"Escalation workflow: {old_tickets} tickets have been open for >30 days.")
+        workflow_candidates.append(f"Escalation: {old_tickets} tickets have been open for >30 days.")
 
-    # Candidate 3: Notify when deal lacks associated company
     c.execute("""SELECT COUNT(*) 
                  FROM deals 
                  WHERE company_id IS NULL OR company_id=''""")
     orphan_deals = c.fetchone()[0]
     if orphan_deals > 0:
-        workflow_candidates.append(f"Notification workflow: {orphan_deals} deals have no associated company.")
+        workflow_candidates.append(f"Notify CSMs: {orphan_deals} deals have no associated company.")
 
     conn.close()
 
@@ -172,6 +168,23 @@ def learning_suggestions():
         "kb_candidates": kb_candidates,
         "workflow_candidates": workflow_candidates
     }
+
+@app.get("/learning/kb-draft")
+def kb_draft(subject: str = Query(...)):
+    """Generate a draft KB article from common ticket subjects (never published)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT content FROM tickets WHERE subject = ? LIMIT 5""", (subject,))
+    examples = [row[0] for row in c.fetchall()]
+    conn.close()
+
+    draft = {
+        "title": f"How to: {subject}",
+        "intro": f"This article addresses the common question: '{subject}'.",
+        "steps": [ex for ex in examples if ex],
+        "note": "⚠️ Draft only. Requires review before publishing."
+    }
+    return draft
 
 # ========================================
 # Background Loop
