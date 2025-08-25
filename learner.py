@@ -40,7 +40,7 @@ async def fetch(endpoint: str, method="get", body=None):
         return r.json()
 
 async def sync_all():
-    # Tickets
+    # Tickets (use schema-aligned endpoint: /tickets/search)
     data = await fetch("/tickets/search", method="post", body={"limit": 100})
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -57,8 +57,8 @@ async def sync_all():
     conn.commit()
     conn.close()
 
-    # Extend with contacts, companies, deals same way...
-    # (for brevity, not duplicating, but yes all 4 entities get synced here)
+    # TODO: extend with contacts, companies, deals using the new schema-aligned endpoints:
+    # /contacts/get/{id}, /companies/get/{id}, /deals/get/{id}, etc.
 
 # Run background sync every 10 mins
 async def background_loop():
